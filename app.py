@@ -1,4 +1,7 @@
 import os
+import glob
+import re
+import time
 import streamlit as st
 import pandas as pd
 from typing import Dict, Any, List
@@ -20,24 +23,49 @@ from visualization import gantt_figure, critical_path_figure
 
 st.set_page_config(page_title="Construction Scheduler", layout="wide")
 
-st.title("🔧 Construction Scheduling Optimizer")
-st.caption("CPM + resource leveling; cached drawing notes on demand. No imputation of durations.")
 
-# Fixed, bundled data paths
+# -------------------------
+# Data file selection
+# -------------------------
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "data")
-CSV_PATH = os.path.join(DATA_DIR, "13 B Renovation_working.csv")
+
+def list_csvs(data_dir: str) -> List[str]:
+    """All CSVs in data_dir, newest modified first."""
+    return sorted(glob.glob(os.path.join(data_dir, "*.csv")), key=os.path.getmtime, reverse=True)
+
+def parse_day_from_name(name: str):
+    """Return integer DayN if present in filename, else None."""
+    m = re.search(r"day\s*(\d+)", name, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def pick_latest_csv(files: List[str]) -> str | None:
+    """Prefer highest DayN; fallback to newest modified."""
+    if not files:
+        return None
+    scored = []
+    for f in files:
+        day = parse_day_from_name(os.path.basename(f))
+        scored.append((f, day, os.path.getmtime(f)))
+    scored.sort(key=lambda x: ((x[1] if x[1] is not None else -1), x[2]), reverse=True)
+    return scored[0][0]
+
+def file_sig(path: str) -> str:
+    """Small signature to bust Streamlit cache when file changes."""
+    st_ = os.stat(path)
+    return f"{os.path.basename(path)}|{st_.st_size}|{int(st_.st_mtime)}"
+
+
+# Bundled PDFs (drawing notes)
 PDF_PATHS = [
     os.path.join(DATA_DIR, "ROY - CIVIL WORKS - DEMOLISION AND EXTENSION.pdf"),
     os.path.join(DATA_DIR, "ROY - CIVIL WORKS - FABRICATION.pdf"),
 ]
 
-missing = [p for p in [CSV_PATH] + PDF_PATHS if not os.path.exists(p)]
-if missing:
-    st.error("Missing bundled files: " + ", ".join([os.path.basename(p) for p in missing]))
-    st.stop()
 
-# ---------- Sidebar ----------
+# -------------------------
+# Sidebar controls
+# -------------------------
 with st.sidebar:
     st.header("Scenario Settings")
     hours_per_day = st.radio("Working hours per day", options=[7.0, 8.0], index=1, horizontal=True)
@@ -48,17 +76,53 @@ with st.sidebar:
     target_days = st.number_input("Target duration (days)", min_value=1, value=30)
     enforce_target = st.toggle("Enforce target (advise to add capacity)", value=False)
 
+    st.subheader("Data file")
+    _all_csvs = list_csvs(DATA_DIR)
+    auto_pick = st.toggle(
+        "Auto-pick newest CSV",
+        value=True,
+        help="Chooses highest DayN in filename; if absent, the newest modified file."
+    )
+    if auto_pick:
+        CSV_PATH = pick_latest_csv(_all_csvs) or os.path.join(DATA_DIR, "13 B Renovation_working.csv")
+        st.caption(f"Auto-selected: {os.path.basename(CSV_PATH)}")
+    else:
+        if not _all_csvs:
+            st.error("No CSVs found in /data.")
+            st.stop()
+        _names = [os.path.basename(p) for p in _all_csvs]
+        _sel = st.selectbox("Choose CSV", _names, index=0)
+        CSV_PATH = os.path.join(DATA_DIR, _sel)
+
     st.subheader("Drawings")
     use_notes = st.toggle("Use drawing notes", value=True)
     refresh_notes = st.button("Refresh notes from PDFs (parse/cache)")
 
-# ---------- Parse CSV ----------
+
+# Verify files exist
+missing = []
+if not os.path.exists(CSV_PATH):
+    missing.append(os.path.basename(CSV_PATH))
+for p in PDF_PATHS:
+    if not os.path.exists(p):
+        missing.append(os.path.basename(p))
+if missing:
+    st.error("Missing bundled files: " + ", ".join(missing))
+    st.stop()
+
+
+# -------------------------
+# Parse CSV (cached)
+# -------------------------
 @st.cache_data(show_spinner=False)
-def _parse_csv_cached(path: str, hours_per_day: float, auto_chain: bool):
+def _parse_csv_cached(path: str, hours_per_day: float, auto_chain: bool, sig: str):
+    # 'sig' is an inert key to invalidate cache when file changes
     return parse_csv_to_tasks(path, working_hours_per_day=hours_per_day, auto_chain_within_subsection=auto_chain)
 
 with st.spinner("Parsing CSV into tasks..."):
-    tasks, warnings = _parse_csv_cached(CSV_PATH, hours_per_day, auto_chain)
+    tasks, warnings = _parse_csv_cached(CSV_PATH, hours_per_day, auto_chain, file_sig(CSV_PATH))
+
+st.info(f"Using data file: **{os.path.basename(CSV_PATH)}**")
 
 if warnings:
     for w in warnings:
@@ -67,7 +131,13 @@ if not tasks:
     st.error("No tasks parsed from CSV.")
     st.stop()
 
-# ---------- Filters ----------
+
+# -------------------------
+# Filters
+# -------------------------
+st.title("🔧 Construction Scheduling Optimizer")
+st.caption("CPM + resource leveling; cached drawing notes on demand. No imputation of durations.")
+
 st.subheader("Filters")
 
 sections = sorted({t["section"] for t in tasks if t.get("section")})
@@ -77,7 +147,6 @@ disciplines_all = sorted({t["discipline"] for t in tasks if t.get("discipline")}
 
 sel_sections = st.multiselect("Sections", sections, default=sections or [])
 
-# Subsections pool depends on selected sections
 subs_pool = sorted({t["subsection"] for t in tasks if t.get("subsection") and (not sel_sections or t["section"] in sel_sections)})
 sel_subs = st.multiselect("Subsections", subs_pool, default=subs_pool or [])
 
@@ -102,7 +171,10 @@ def _passes(t):
 
 f_tasks = [t for t in tasks if _passes(t)]
 
-# ---------- Crew Availability (when pooling) ----------
+
+# -------------------------
+# Crew availability (categories)
+# -------------------------
 st.subheader("Crew Availability (by category)")
 capacity_by_category: Dict[str, int] = {}
 if categories_all:
@@ -115,7 +187,10 @@ if categories_all:
 else:
     st.caption("No crew categories detected in CSV.")
 
-# ---------- Compute CPM + leveled schedule ----------
+
+# -------------------------
+# CPM + Resource leveling
+# -------------------------
 with st.spinner("Computing CPM + leveled schedule..."):
     base = compute_cpm_baseline(f_tasks)
     schedule = level_resources(
@@ -131,7 +206,10 @@ if enforce_target and metrics["duration_days"] > target_days:
         "Use Resources & Bottlenecks → What-if to get capacity suggestions."
     )
 
-# ---------- Tabs ----------
+
+# -------------------------
+# Tabs
+# -------------------------
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["Schedule", "Critical Path", "Resources & Bottlenecks", "Inefficiencies", "Notes"]
 )
@@ -145,7 +223,7 @@ with tab2:
     st.subheader("Baseline CPM")
     fig_cp = critical_path_figure(f_tasks, base, start_date=str(start_date))
     st.plotly_chart(fig_cp, use_container_width=True, theme="streamlit")
-    # Zero-slack tasks list
+
     crit_rows = []
     for t in f_tasks:
         info = base[t["id"]]
@@ -232,7 +310,7 @@ with tab5:
                 hide_index=True, use_container_width=True
             )
 
-# Optional: quick sanity summary of parsed hierarchy
+# Quick sanity summary of parsed hierarchy
 with st.expander("Debug: Parsed hierarchy summary", expanded=False):
     from collections import defaultdict
     sec_summary = defaultdict(lambda: {"subsections": set(), "tasks": 0})

@@ -32,10 +32,18 @@ DISCIPLINE_ANCHORS = [
     r"^Carpentry$",
 ]
 
+# Subsections that are cost-only (duration must not count toward schedule)
+COST_ONLY_SUBSECTION_PATTERNS = [
+    r"staffing\s*expenses?",   # "Staffing expenses"
+    r"\bcosts?\b",
+    r"\bbudget\b",
+]
+
 def _matches_any(label: Optional[str], patterns) -> bool:
     if not label:
         return False
-    return any(re.match(p, label.strip(), re.IGNORECASE) for p in patterns)
+    # use search() so substrings match (e.g., "Staffing expenses")
+    return any(re.search(p, label.strip(), re.IGNORECASE) for p in patterns)
 
 def _safe_series_get(row: pd.Series, key: Optional[str]):
     if key is None:
@@ -125,13 +133,14 @@ def parse_csv_to_tasks(csv_path: str,
             current_discipline = label
             continue
 
-        # Conservative: if row looks like an empty header, we don't auto-promote it to section
+        # Conservative: if row looks like an empty header, do not auto-promote to section
         if _is_section_header(row, triplets):
-            # Could set current_section = label here, but that caused noise; skip
             continue
 
         # Otherwise it's a Subsection line under the current major Section
         subsection = label
+        is_cost_only = _matches_any(subsection, COST_ONLY_SUBSECTION_PATTERNS)
+
         for (day_col, time_col, labour_col, dnum) in triplets:
             name = _clean_str(_safe_series_get(row, day_col))
             if not name:
@@ -139,7 +148,8 @@ def parse_csv_to_tasks(csv_path: str,
             name = re.sub(r"\s+,", ",", name).strip().rstrip(",")
 
             dur_val = _safe_series_get(row, time_col)
-            duration_hours = float(dur_val) if pd.notna(dur_val) else None
+            # Cost-only rows do not contribute hours
+            duration_hours = float(dur_val) if (pd.notna(dur_val) and not is_cost_only) else None
 
             labour_val = _clean_str(_safe_series_get(row, labour_col))
             crew_code = None
@@ -156,7 +166,7 @@ def parse_csv_to_tasks(csv_path: str,
                 "id": task_id,
                 "section": current_section,
                 "subsection": subsection,
-                "discipline": current_discipline,   # NEW: tag like Demolition/Electrical/etc.
+                "discipline": current_discipline,   # tag like Demolition/Electrical/etc.
                 "name": name,
                 "planned_day": int(dnum),
                 "duration_hours": duration_hours,   # may be None (no imputation)
@@ -178,6 +188,7 @@ def parse_csv_to_tasks(csv_path: str,
                 cur["dependencies"].append(prev["id"])
 
     return tasks, warnings
+
 
 # -------- PDF cache (pdfplumber) --------
 
@@ -242,6 +253,7 @@ def rebuild_drawing_notes_cache(pdf_paths: List[str], cache_dir: str = "data"):
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     return load_drawing_notes_from_cache(cache_dir)
+
 
 # -------- Fuzzy note↔task matching --------
 
